@@ -1,0 +1,89 @@
+# SWING HUNTER — GitHub Actions Workflow
+# 3 scans daily, sends Telegram alerts — 100% FREE!
+#
+# SETUP:
+# 1. github.com → New repo "swing-hunter" (private)
+# 2. Upload swing_hunter.py to repo
+# 3. Settings → Secrets → Actions → Add:
+#    TELEGRAM_TOKEN  = your bot token
+#    TELEGRAM_CHAT_ID = your chat ID
+# 4. Upload this file to .github/workflows/scan.yml
+# Done! Auto runs every weekday.
+
+name: Swing Hunter 3-Scan System
+
+on:
+  schedule:
+    - cron: '30 12 * * 1-5'   # 6:00 PM IST  (Mon-Fri)
+    - cron: '30 14 * * 1-5'   # 8:00 PM IST  (Mon-Fri)
+    - cron: '45 3  * * 2-6'   # 9:15 AM IST  (Tue-Sat)
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Scan to run'
+        required: true
+        default: 'scan1'
+        type: choice
+        options: [scan1, scan2, scan3, test]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install packages
+        run: pip install yfinance pandas requests
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            shortlist.json
+            fundamentals_cache.json
+            stocks_cache.json
+          key: swing-cache-${{ github.run_id }}
+          restore-keys: swing-cache-
+
+      - name: Detect scan type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "SCAN_TYPE=${{ github.event.inputs.scan_type }}" >> $GITHUB_ENV
+          else
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "12" ]; then echo "SCAN_TYPE=scan1" >> $GITHUB_ENV
+            elif [ "$HOUR" = "14" ]; then echo "SCAN_TYPE=scan2" >> $GITHUB_ENV
+            elif [ "$HOUR" = "03" ]; then echo "SCAN_TYPE=scan3" >> $GITHUB_ENV
+            else echo "SCAN_TYPE=scan1" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Run scan
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python swing_hunter.py $SCAN_TYPE
+        timeout-minutes: 55
+
+      - name: Save cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            shortlist.json
+            fundamentals_cache.json
+            stocks_cache.json
+          key: swing-cache-${{ github.run_id }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ env.SCAN_TYPE }}-${{ github.run_number }}
+          path: "*.log"
+          retention-days: 7
