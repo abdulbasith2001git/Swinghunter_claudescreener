@@ -38,7 +38,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install packages
-        run: pip install yfinance pandas requests
+        run: pip install yfinance pandas requests schedule
 
       - name: Restore cache
         uses: actions/cache@v4
