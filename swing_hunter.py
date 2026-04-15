@@ -29,6 +29,7 @@ PYTHONANYWHERE (run without laptop — FREE):
   NOTE: Free account only allows 1 task. Upgrade to $5/month for 3 tasks.
   OR: Use your laptop with the auto scheduler (keeps all 3 scans)
 """
+
 INSTALL:
   pip install yfinance pandas requests schedule
 
@@ -39,7 +40,11 @@ from email.mime.multipart import MIMEMultipart
 
 def install_if_missing():
     import subprocess
-    for pkg in ['yfinance','pandas','requests','schedule']:
+    # schedule only needed for local laptop mode, not GitHub Actions
+    pkgs = ['yfinance','pandas','requests']
+    if len(sys.argv) <= 1:  # no args = scheduler mode = need schedule
+        pkgs.append('schedule')
+    for pkg in pkgs:
         try: __import__(pkg)
         except ImportError:
             print(f"  Installing {pkg}...")
@@ -50,7 +55,13 @@ install_if_missing()
 import yfinance as yf
 import pandas as pd
 import requests
-import schedule
+
+# schedule only imported in local mode
+try:
+    import schedule
+    HAS_SCHEDULE = True
+except ImportError:
+    HAS_SCHEDULE = False
 
 # ══════════════════════════════════════════════════════════════
 #  ⚙️  CONFIG
@@ -320,12 +331,14 @@ def adx(df,n=14):
 # ══════════════════════════════════════════════════════════════
 #  🏆 SCORING
 # ══════════════════════════════════════════════════════════════
-def tech_score(rsi_v, adx_v, vr, bp, p52):
-    s  = max(0, 30-abs(rsi_v-62)*2)
-    s += min(25, max(0,(adx_v-18)*1.1))
-    s += min(20, max(0,(vr-1.4)*9))
-    s += min(15, bp*4)
-    s += 10 if p52<5 else 6 if p52<15 else 3 if p52<30 else 0
+def tech_score(rsi_v, adx_v, vr, bp, p52, last3=0):
+    s  = max(0, 30-abs(rsi_v-62)*2)         # RSI sweet spot    max 30
+    s += min(25, max(0,(adx_v-18)*1.1))      # ADX strength      max 25
+    s += min(20, max(0,(vr-1.4)*9))          # Volume surge      max 20
+    s += min(15, bp*4)                        # Breakout %        max 15
+    s += 10 if p52<5 else 6 if p52<15 else 3 if p52<30 else 0  # 52W proximity
+    # Momentum bonus — fast movers get extra points
+    s += min(10, max(0, last3 * 1.5))        # 3-day momentum    max 10
     return round(min(100,max(0,s)),1)
 
 def fund_score(roe,de,pm,rg):
@@ -398,12 +411,27 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
                 s5d = ((c-float(df['Close'].iloc[-5]))/float(df['Close'].iloc[-5]))*100
                 if s5d < 0: return None
 
-        # Apply mode-based threshold adjustments
-        mode = RULES.get('SCAN_MODE', 'STRICT')
-        rsi_max_eff  = RULES['RSI_MAX']  if mode=='STRICT' else min(RULES['RSI_MAX']+3, 75)
-        adx_min_eff  = RULES['ADX_MIN']  if mode=='STRICT' else max(RULES['ADX_MIN']-3, 12)
-        vol_min_eff  = RULES['VOLUME_MULT'] if mode=='STRICT' else max(RULES['VOLUME_MULT']-0.2, 1.1)
-        del_min_eff  = RULES['MIN_DELIVERY_PCT'] if mode=='STRICT' else max(RULES['MIN_DELIVERY_PCT']-10, 20)
+        # Dynamic thresholds — BULL market gets relaxed filters to catch more winners
+        # STRICT mode or BEAR = tight filters
+        scan_mode = RULES.get('SCAN_MODE', 'STRICT')
+        is_bull   = market_mode == "BULL"
+
+        if is_bull and scan_mode == 'STRICT':
+            # Auto-relax in confirmed bull market
+            rsi_max_eff = min(RULES['RSI_MAX'] + 3, 75)   # 72 → 75
+            adx_min_eff = max(RULES['ADX_MIN'] - 2, 14)   # 18 → 16
+            vol_min_eff = max(RULES['VOLUME_MULT'] - 0.2, 1.1)  # 1.4 → 1.2
+            del_min_eff = max(RULES['MIN_DELIVERY_PCT'] - 5, 25) # 30 → 25
+        elif scan_mode == 'RELAXED':
+            rsi_max_eff = min(RULES['RSI_MAX'] + 5, 76)
+            adx_min_eff = max(RULES['ADX_MIN'] - 4, 12)
+            vol_min_eff = max(RULES['VOLUME_MULT'] - 0.3, 1.0)
+            del_min_eff = max(RULES['MIN_DELIVERY_PCT'] - 10, 20)
+        else:
+            rsi_max_eff = RULES['RSI_MAX']
+            adx_min_eff = RULES['ADX_MIN']
+            vol_min_eff = RULES['VOLUME_MULT']
+            del_min_eff = RULES['MIN_DELIVERY_PCT']
 
         # Technical filters
         if c<=e20: return None
@@ -417,11 +445,32 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
         if bp <RULES['BREAKOUT_MIN_PCT']:                   return None
         if av <adx_min_eff:                                 return None
         if cp <RULES['CANDLE_MIN_PCT']:                     return None
+
+        # Candle strength — close must be in upper 80% of candle range
+        # Filters out shooting star / doji / weak breakout candles
+        try:
+            day_high = float(df['High'].iloc[-1])
+            day_low  = float(df['Low'].iloc[-1])
+            candle_range = day_high - day_low
+            if candle_range > 0:
+                close_position = (c - day_low) / candle_range
+                if close_position < 0.5:  # closing in lower half = rejection candle
+                    return None
+        except: pass
         if c >=RULES['EMA20_MAX_STRETCH']*e20:              return None
         if RULES['USE_DELIVERY'] and deliv is not None:
             if deliv<del_min_eff:                           return None
 
-        ts  = tech_score(rv,av,vr,bp,p52)
+        # Momentum boost — only fast movers (up 2%+ in last 3 days)
+        try:
+            last3_ret = ((c - float(df['Close'].iloc[-4])) / float(df['Close'].iloc[-4])) * 100
+        except: last3_ret = 0
+
+        # Smart money trap filter — high RSI with low volume = retail trap
+        if rv > 68 and vr < 1.8:
+            return None  # RSI pumped by low volume = retail trap, skip
+
+        ts  = tech_score(rv,av,vr,bp,p52,last3_ret)
         fs  = fund_score(roe,de,pm,rg)
         sms = sm_score(deliv,vr)
         fs_ = final_score(ts,fs,sms)
@@ -577,7 +626,7 @@ def get_verdict(stock, scan_type="scan1"):
 # ══════════════════════════════════════════════════════════════
 #  💬 MESSAGE BUILDERS
 # ══════════════════════════════════════════════════════════════
-def msg_scan1(results, scanned, nse_date, nifty_ret, market_mode):
+def msg_scan1(results, scanned, nse_date, nifty_ret, banknifty_ret, market_mode):
     now  = datetime.datetime.now().strftime('%d %b %Y')
     mood = {'BULL':'🟢 BULL','NEUTRAL':'🟡 NEUTRAL','BEAR':'🔴 BEAR'}.get(market_mode,'🟡 NEUTRAL')
     nse  = f"✅ NSE Delivery: {nse_date}" if nse_date else "⚠️ No delivery data yet"
@@ -606,16 +655,18 @@ def msg_scan1(results, scanned, nse_date, nifty_ret, market_mode):
         msg += f"{i}. <b>{r['symbol']}</b>{sect}\n"
         msg += f"   {verdict} | Score: {r['score']}/100\n"
         msg += f"   Rs.{r['close']} | RSI:{r['rsi']} | ADX:{r['adx']} | Vol:{r['vol_ratio']}x\n"
-        msg += f"   Breakout: +{r['bo_pct']}%"
+        last3_str = f" | 3D Momentum:+{r.get('last3_ret',0)}%" if r.get('last3_ret',0) > 0 else ""
+        msg += f"   Breakout: +{r['bo_pct']}%{last3_str}"
         if r['delivery']: msg += f" | Delivery: {r['delivery']}%"
         msg += f" | 52WH: -{r['p52wh']}%\n"
-        if r['roe']:     msg += f"   ROE:{r['roe']}%"
-        if r['debt_eq'] is not None: msg += f" D/E:{r['debt_eq']}"
-        if r['rev_growth']: msg += f" RevGrowth:{r['rev_growth']}%"
-        if r['roe'] or r['debt_eq'] is not None: msg += "\n"
+        fund_parts = []
+        if r['roe']:                     fund_parts.append(f"ROE:{r['roe']}%")
+        if r['debt_eq'] is not None:     fund_parts.append(f"D/E:{r['debt_eq']}")
+        if r['rev_growth']:              fund_parts.append(f"RevG:{r['rev_growth']}%")
+        if fund_parts: msg += f"   {' | '.join(fund_parts)}\n"
         msg += f"   SL: Rs.{r['sl']} | T1: Rs.{r['target1']} | T2: Rs.{r['target2']}\n"
         msg += f"   R:R = 1:{r['rr']} | Buy {r['pos_size']} shares ≈ Rs.{r['invest_amt']}\n"
-        if issues: msg += f"   ⚠️ {issues[0]}\n"
+        for iss in issues[:1]: msg += f"   ⚠️ {iss}\n"
         msg += "\n"
 
     msg += ("─"*35 + "\n"
@@ -624,7 +675,7 @@ def msg_scan1(results, scanned, nse_date, nifty_ret, market_mode):
             "Not SEBI registered advice")
     return msg
 
-def msg_scan2(results, prev_results, nse_date, nifty_ret, market_mode):
+def msg_scan2(results, prev_results, nse_date, nifty_ret, banknifty_ret, market_mode):
     now  = datetime.datetime.now().strftime('%d %b %Y')
     mood = {'BULL':'🟢 BULL','NEUTRAL':'🟡 NEUTRAL','BEAR':'🔴 BEAR'}.get(market_mode,'🟡 NEUTRAL')
 
@@ -703,7 +754,7 @@ def msg_scan2(results, prev_results, nse_date, nifty_ret, market_mode):
             "Not SEBI registered advice")
     return msg
 
-def msg_scan3(results, prev_results, nifty_ret, market_mode):
+def msg_scan3(results, prev_results, nifty_ret, banknifty_ret, market_mode):
     now  = datetime.datetime.now().strftime('%d %b %Y')
     mood = {'BULL':'🟢 BULL','NEUTRAL':'🟡 NEUTRAL','BEAR':'🔴 BEAR'}.get(market_mode,'🟡 NEUTRAL')
 
@@ -858,7 +909,7 @@ def run_scan1():
                    'market_mode':market_mode,'nse_date':nse_date}, f, indent=2)
 
     log.info(f"\nSCAN 1 DONE: {len(results)} stocks found from {len(stocks)}")
-    msg = msg_scan1(results, len(stocks), nse_date, nifty_ret, market_mode)
+    msg = msg_scan1(results, len(stocks), nse_date, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
 
 def run_scan2():
@@ -912,7 +963,7 @@ def run_scan2():
                    'market_mode':market_mode,'nse_date':nse_date}, f, indent=2)
 
     log.info(f"\nSCAN 2 DONE: {len(results)} stocks confirmed")
-    msg = msg_scan2(results, prev_results, nse_date, nifty_ret, market_mode)
+    msg = msg_scan2(results, prev_results, nse_date, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
 
 def run_scan3():
@@ -964,7 +1015,7 @@ def run_scan3():
     results.sort(key=lambda x: x['score'], reverse=True)
 
     log.info(f"\nSCAN 3 DONE: {len(results)} stocks cleared final check")
-    msg = msg_scan3(results, prev_results, nifty_ret, market_mode)
+    msg = msg_scan3(results, prev_results, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
 
 # ══════════════════════════════════════════════════════════════
@@ -1077,6 +1128,10 @@ def main():
     if not CONFIG['TELEGRAM_TOKEN']:
         print("\n  ⚠️  Edit CONFIG at top of file — add TELEGRAM_TOKEN and CHAT_ID\n")
 
+    if not HAS_SCHEDULE:
+        print("  ⚠️  Install schedule: pip install schedule")
+        print("  Then re-run without arguments for auto scheduler")
+        return
     schedule.every().day.at(CONFIG['SCAN1_TIME']).do(run_scan1)
     schedule.every().day.at(CONFIG['SCAN2_TIME']).do(run_scan2)
     schedule.every().day.at(CONFIG['SCAN3_TIME']).do(run_scan3)
