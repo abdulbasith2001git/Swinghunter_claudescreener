@@ -5,7 +5,7 @@
 ║                                                              ║
 ║  SCAN 1 @ 6:00 PM  → Full universe scan, NSE bhavcopy loaded║
 ║  SCAN 2 @ 8:00 PM  → Recheck shortlisted stocks only        ║
-║  SCAN 3 @ 9:15 AM  → Pre-market final verdict BUY/WAIT/SKIP ║
+║  SCAN 3 @ 9:30 AM  → Pre-market final verdict BUY/WAIT/SKIP ║
 ║                                                              ║
 ║  All alerts → Telegram                                       ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -25,7 +25,7 @@ PYTHONANYWHERE (run without laptop — FREE):
   4. Tasks → Add 3 daily tasks:
        Task 1: 12:30 UTC = 6:00 PM IST  → python /home/USER/swing_hunter.py scan1
        Task 2: 14:30 UTC = 8:00 PM IST  → python /home/USER/swing_hunter.py scan2
-       Task 3: 03:45 UTC = 9:15 AM IST  → python /home/USER/swing_hunter.py scan3
+       Task 3: 03:45 UTC = 9:15 AM IST  → python /home/USER/swing_hunter.py scan3  # 9:30 AM IST = 04:00 UTC
   NOTE: Free account only allows 1 task. Upgrade to $5/month for 3 tasks.
   OR: Use your laptop with the auto scheduler (keeps all 3 scans)
 
@@ -70,7 +70,7 @@ CONFIG = {
     # Scan times (IST)
     "SCAN1_TIME"    : "18:00",   # 6:00 PM — full universe scan
     "SCAN2_TIME"    : "20:00",   # 8:00 PM — recheck shortlist
-    "SCAN3_TIME"    : "09:15",   # 9:15 AM next morning — final verdict
+    "SCAN3_TIME"    : "09:30",   # 9:15 AM next morning — final verdict
 
     # Capital
     "TOTAL_CAPITAL" : 5000,
@@ -97,11 +97,18 @@ RULES = {
     "USE_ANTI_GAP"      : True,
     "MAX_GAP_PCT"       : 3.5,
     "USE_FUND_FILTER"   : True,
-    "MIN_ROE"           : 5,
-    "MAX_DEBT_EQUITY"   : 3.0,
-    "MIN_PROFIT_MARGIN" : -5,
+    "MIN_ROE"           : 8,     # Block truly bad fundamentals
+    "MAX_DEBT_EQUITY"   : 1.8,   # Block high debt
+    "MIN_PROFIT_MARGIN" : 3,     # Must be profitable
+    "MIN_REV_GROWTH"    : -5,    # Block heavily declining revenue
     "BULL_THRESHOLD"    : 1.5,
     "BEAR_THRESHOLD"    : -3.0,
+
+    # ── Scan Mode ─────────────────────────────────────────────
+    # STRICT = fewer but higher quality stocks (default)
+    # RELAXED = more stocks, useful when market is in early recovery
+    # Change to "RELAXED" if you keep getting 0 results
+    "SCAN_MODE"         : "STRICT",
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -381,14 +388,22 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
 
         # Hard filters
         if RULES['USE_FUND_FILTER']:
-            if roe is not None and roe  < RULES['MIN_ROE']:           return None
-            if de  is not None and de   > RULES['MAX_DEBT_EQUITY']:   return None
-            if pm  is not None and pm   < RULES['MIN_PROFIT_MARGIN']: return None
+            if roe is not None and roe  < RULES['MIN_ROE']:                    return None
+            if de  is not None and de   > RULES['MAX_DEBT_EQUITY']:            return None
+            if pm  is not None and pm   < RULES['MIN_PROFIT_MARGIN']:          return None
+            if rg  is not None and rg   < RULES.get('MIN_REV_GROWTH', -20):   return None
         if RULES['USE_ANTI_GAP'] and gap > RULES['MAX_GAP_PCT']:      return None
         if market_mode == "BEAR":
             if len(df)>=5:
                 s5d = ((c-float(df['Close'].iloc[-5]))/float(df['Close'].iloc[-5]))*100
                 if s5d < 0: return None
+
+        # Apply mode-based threshold adjustments
+        mode = RULES.get('SCAN_MODE', 'STRICT')
+        rsi_max_eff  = RULES['RSI_MAX']  if mode=='STRICT' else min(RULES['RSI_MAX']+3, 75)
+        adx_min_eff  = RULES['ADX_MIN']  if mode=='STRICT' else max(RULES['ADX_MIN']-3, 12)
+        vol_min_eff  = RULES['VOLUME_MULT'] if mode=='STRICT' else max(RULES['VOLUME_MULT']-0.2, 1.1)
+        del_min_eff  = RULES['MIN_DELIVERY_PCT'] if mode=='STRICT' else max(RULES['MIN_DELIVERY_PCT']-10, 20)
 
         # Technical filters
         if c<=e20: return None
@@ -396,15 +411,15 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
         if RULES['REQUIRE_EMA_STACK'] and e20<=e50:        return None
         if RULES['REQUIRE_SMA200']    and c<=s200:         return None
         if rv<=RULES['RSI_MIN']:                            return None
-        if rv>=RULES['RSI_MAX']:                            return None
-        if vr <RULES['VOLUME_MULT']:                        return None
+        if rv>=rsi_max_eff:                                 return None
+        if vr <vol_min_eff:                                 return None
         if c <=hin:                                         return None
         if bp <RULES['BREAKOUT_MIN_PCT']:                   return None
-        if av <RULES['ADX_MIN']:                            return None
+        if av <adx_min_eff:                                 return None
         if cp <RULES['CANDLE_MIN_PCT']:                     return None
         if c >=RULES['EMA20_MAX_STRETCH']*e20:              return None
         if RULES['USE_DELIVERY'] and deliv is not None:
-            if deliv<RULES['MIN_DELIVERY_PCT']:             return None
+            if deliv<del_min_eff:                           return None
 
         ts  = tech_score(rv,av,vr,bp,p52)
         fs  = fund_score(roe,de,pm,rg)
@@ -525,29 +540,37 @@ def get_verdict(stock, scan_type="scan1"):
         issues.append(f"Score {r['score']}/100 — low confidence")
 
     # Final verdict logic
-    critical_issues = [i for i in issues if '❌' in i or 'too late' in i or 'RSI' in i and 'dangerously' in i]
+    # Critical = actual deal breakers (declining revenue, gap-up trap, overbought at open)
+    # RSI near 70 in scan1/2 is just a WARNING, not a deal breaker — will be re-evaluated in scan3
+    hard_fails  = [i for i in issues if '❌' in i or 'too late' in i]
+    rsi_warning = any('RSI' in i for i in issues)
+
     if scan_type == "scan3":
-        # Strictest — morning before market open
-        if len(critical_issues) >= 1:
+        # Strictest — morning verdict. RSI still high at open = skip
+        if hard_fails or (rsi_warning and len(issues) >= 2):
             verdict = "🔴 SKIP"
-            action  = "Do NOT buy today — wait for better setup"
+            action  = "Do NOT buy today — setup degraded"
         elif len(issues) >= 2:
             verdict = "🟡 WAIT"
-            action  = "Watch for first 15 min — buy only if price stays stable"
+            action  = "Watch 9:20-9:25 AM — buy only if stable and RSI not rising"
         else:
             verdict = "🟢 BUY"
-            action  = f"Buy between 9:20-9:30 AM near Rs.{r['close']}"
+            action  = f"Buy between 9:35-9:45 AM near Rs.{r['close']}"
     else:
-        # Scan 1 & 2 — preliminary
-        if len(critical_issues) >= 1:
+        # Scan 1 & 2 — informational, not final
+        # Only flag LIKELY SKIP if there are hard fundamental/revenue fails
+        if hard_fails:
             verdict = "🔴 LIKELY SKIP"
-            action  = "Not looking great — monitor only"
-        elif len(issues) >= 2:
+            action  = "Fundamental concern — monitor only"
+        elif rsi_warning and len(issues) >= 2:
+            verdict = "🟡 WATCHLIST (RSI high)"
+            action  = "RSI elevated — confirm RSI cools by 9 AM tomorrow"
+        elif len(issues) >= 1:
             verdict = "🟡 WATCHLIST"
-            action  = "Promising but has concerns — check again in next scan"
+            action  = "Promising — confirm in next scan"
         else:
             verdict = "🟢 STRONG CANDIDATE"
-            action  = "Looking good — confirm in next scan"
+            action  = "Looking great — confirm in scan 2 and 3"
 
     return verdict, action, green, issues
 
@@ -559,9 +582,10 @@ def msg_scan1(results, scanned, nse_date, nifty_ret, market_mode):
     mood = {'BULL':'🟢 BULL','NEUTRAL':'🟡 NEUTRAL','BEAR':'🔴 BEAR'}.get(market_mode,'🟡 NEUTRAL')
     nse  = f"✅ NSE Delivery: {nse_date}" if nse_date else "⚠️ No delivery data yet"
 
-    msg  = (f"🔍 SWING HUNTER — SCAN 1 (6 PM)\n"
+    mode_tag = f" | Mode: {RULES.get('SCAN_MODE','STRICT')}"
+    msg  = (f"🔍 SWING HUNTER — SCAN 1 (6 PM){mode_tag}\n"
             f"📅 {now} | Market: {mood}\n"
-            f"Nifty 5D: {'+' if nifty_ret>=0 else ''}{nifty_ret}%\n"
+            f"Nifty5D:{'+ ' if nifty_ret>=0 else ''}{nifty_ret}% | BankNifty5D:{'+ ' if banknifty_ret>=0 else ''}{banknifty_ret}%\n"
             f"{nse}\n"
             f"Scanned: {scanned} stocks\n\n")
 
@@ -721,7 +745,7 @@ def msg_scan3(results, prev_results, nifty_ret, market_mode):
             msg += f"   RSI:{r['rsi']} | ADX:{r['adx']} | Vol:{r['vol_ratio']}x\n"
             if r['delivery']: msg += f"   Delivery: {r['delivery']}% ✅\n"
             msg += f"\n   📌 TRADE PLAN:\n"
-            msg += f"   Entry  : Rs.{r['close']} (buy between 9:20-9:30 AM)\n"
+            msg += f"   Entry  : Rs.{r['close']} (buy between 9:35-9:45 AM)\n"
             msg += f"   SL     : Rs.{r['sl']} (-5%) ← GTT order immediately!\n"
             msg += f"   Target1: Rs.{r['target1']} (+8%) ← sell half here\n"
             msg += f"   Target2: Rs.{r['target2']} (+15%) ← sell rest here\n"
@@ -751,10 +775,15 @@ def msg_scan3(results, prev_results, nifty_ret, market_mode):
     # Final rules reminder
     msg += ("─"*35 + "\n"
             "📋 GOLDEN RULES:\n"
+            "✅ Buy 9:35-9:45 AM (NOT at open)\n"
+            "✅ Check: price above breakout + RSI<70 + vol strong\n"
             "✅ Set GTT SL the moment you buy\n"
-            "✅ +5% hit → move SL to cost (free trade!)\n"
-            "✅ +8% hit → sell half, let rest run\n"
-            "✅ Exit ALL on Day 7 — no waiting\n"
+            "⬆️  TRAILING SL:\n"
+            "   +5% hit  → move SL to your cost (free trade!)\n"
+            "   +10% hit → move SL to EMA20 (lock profits)\n"
+            "✅ +8% hit  → sell HALF, let rest run to T2\n"
+            "✅ Exit ALL on Day 7 — no emotions\n"
+            "❌ Never buy if already +4-5% from yesterday close\n"
             "❌ Never average down if SL hits\n\n"
             "Not SEBI registered advice")
     return msg
@@ -763,16 +792,32 @@ def msg_scan3(results, prev_results, nifty_ret, market_mode):
 #  🚀 THE 3 SCANS
 # ══════════════════════════════════════════════════════════════
 def get_market_data():
-    """Shared setup for all scans"""
+    """Nifty + Bank Nifty confirmation for stronger regime signal"""
+    nifty_ret = 0
+    banknifty_ret = 0
     try:
-        nifty_df  = yf.Ticker("^NSEI").history(period="20d", interval="1d")
-        nifty_ret = round(((float(nifty_df['Close'].iloc[-1]) -
-                           float(nifty_df['Close'].iloc[-5])) /
-                           float(nifty_df['Close'].iloc[-5])) * 100, 2)
-    except: nifty_ret = 0
-    mode = "BULL" if nifty_ret>RULES['BULL_THRESHOLD'] else \
-           "BEAR" if nifty_ret<RULES['BEAR_THRESHOLD'] else "NEUTRAL"
-    return nifty_ret, mode
+        df_n = yf.Ticker("^NSEI").history(period="20d", interval="1d")
+        nifty_ret = round(((float(df_n['Close'].iloc[-1]) -
+                           float(df_n['Close'].iloc[-5])) /
+                           float(df_n['Close'].iloc[-5])) * 100, 2)
+    except: pass
+    try:
+        df_b = yf.Ticker("^NSEBANK").history(period="20d", interval="1d")
+        banknifty_ret = round(((float(df_b['Close'].iloc[-1]) -
+                               float(df_b['Close'].iloc[-5])) /
+                               float(df_b['Close'].iloc[-5])) * 100, 2)
+    except: pass
+
+    # Both Nifty AND BankNifty must confirm for BULL
+    # Either one going BEAR = cautious
+    if nifty_ret > RULES['BULL_THRESHOLD'] and banknifty_ret > RULES['BULL_THRESHOLD']:
+        mode = "BULL"
+    elif nifty_ret < RULES['BEAR_THRESHOLD'] or banknifty_ret < RULES['BEAR_THRESHOLD']:
+        mode = "BEAR"
+    else:
+        mode = "NEUTRAL"
+
+    return nifty_ret, banknifty_ret, mode
 
 def run_scan1():
     """6:00 PM — Full universe scan with final bhavcopy data"""
@@ -787,9 +832,9 @@ def run_scan1():
     stocks       = get_stock_list()
     delivery_map, nse_date = fetch_bhavcopy()
     fund_cache   = load_fund_cache()
-    nifty_ret, market_mode = get_market_data()
+    nifty_ret, banknifty_ret, market_mode = get_market_data()
 
-    log.info(f"Universe: {len(stocks)} | Market: {market_mode} | Nifty5D: {nifty_ret}%")
+    log.info(f"Universe: {len(stocks)} | Market: {market_mode} | Nifty5D:{nifty_ret}% BankNifty5D:{banknifty_ret}%")
 
     results = []
     for i, sym in enumerate(stocks):
@@ -843,7 +888,7 @@ def run_scan2():
 
     delivery_map, nse_date = fetch_bhavcopy()
     fund_cache   = load_fund_cache()
-    nifty_ret, market_mode = get_market_data()
+    nifty_ret, banknifty_ret, market_mode = get_market_data()
 
     results = []
     for sym in shortlist_syms:
@@ -897,7 +942,7 @@ def run_scan3():
 
     delivery_map, _ = fetch_bhavcopy()
     fund_cache       = load_fund_cache()
-    nifty_ret, market_mode = get_market_data()
+    nifty_ret, banknifty_ret, market_mode = get_market_data()
 
     if market_mode == "BEAR":
         send_telegram(f"🚀 SCAN 3 (9:15 AM FINAL)\n\n🔴 MARKET IS BEARISH (Nifty 5D: {nifty_ret}%)\n\nRecommendation: SIT ON CASH TODAY\nDo not trade in a falling market — wait for recovery!\n\nNot SEBI advice")
