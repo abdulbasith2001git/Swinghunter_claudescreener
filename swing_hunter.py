@@ -28,10 +28,10 @@ PYTHONANYWHERE (run without laptop — FREE):
        Task 3: 03:45 UTC = 9:15 AM IST  → python /home/USER/swing_hunter.py scan3  # 9:30 AM IST = 04:00 UTC
   NOTE: Free account only allows 1 task. Upgrade to $5/month for 3 tasks.
   OR: Use your laptop with the auto scheduler (keeps all 3 scans)
-
+"""
 INSTALL:
   pip install yfinance pandas requests schedule
-"""
+
 
 import time, datetime, sys, json, smtplib, os, logging, random
 from email.mime.text import MIMEText
