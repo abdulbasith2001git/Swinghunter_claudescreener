@@ -1,76 +1,93 @@
-# SWING HUNTER — GitHub Actions Workflow
-# 3 scans daily, sends Telegram alerts — 100% FREE!
+# SWING HUNTER v7 — GitHub Actions Workflow
+# Runs 3 scans daily, sends Telegram alerts — 100% FREE!
 #
 # SETUP:
-# 1. github.com → New repo "swing-hunter" (private)
-# 2. Upload swing_hunter.py to repo
+# 1. github.com → New private repo
+# 2. Upload swing_hunter.py and this file to .github/workflows/scan.yml
 # 3. Settings → Secrets → Actions → Add:
-#    TELEGRAM_TOKEN  = your bot token
+#    TELEGRAM_TOKEN   = your bot token
 #    TELEGRAM_CHAT_ID = your chat ID
-# 4. Upload this file to .github/workflows/scan.yml
-# Done! Auto runs every weekday.
+# Done!
 
 name: Swing Hunter 3-Scan System
 
 on:
   schedule:
-    - cron: '30 12 * * 1-5'   # 6:00 PM IST  (Mon-Fri)
-    - cron: '30 14 * * 1-5'   # 8:00 PM IST  (Mon-Fri)
-    - cron: '45 3  * * 2-6'   # 9:15 AM IST  (Tue-Sat)
+    - cron: '30 12 * * 1-5'   # Scan 1 — 6:00 PM IST  (Mon-Fri)
+    - cron: '30 14 * * 1-5'   # Scan 2 — 8:00 PM IST  (Mon-Fri)
+    - cron: '00 4  * * 2-6'   # Scan 3 — 9:30 AM IST  (Tue-Sat) ← 9:30 as per suggestion
   workflow_dispatch:
     inputs:
       scan_type:
-        description: 'Scan to run'
+        description: 'Which scan to run?'
         required: true
         default: 'scan1'
         type: choice
-        options: [scan1, scan2, scan3, test]
+        options: [scan1, scan2, scan3, test, telegram]
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 90
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install packages
-        run: pip install yfinance pandas requests schedule
+        run: pip install yfinance pandas requests
 
-      - name: Restore cache
+      # ─── FIX: Use DATE-based cache key so all 3 scans share the same cache ───
+      - name: Get today's date
+        run: echo "TODAY=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+
+      - name: Restore shared daily cache
         uses: actions/cache@v4
         with:
           path: |
             shortlist.json
             fundamentals_cache.json
             stocks_cache.json
-          key: swing-cache-${{ github.run_id }}
-          restore-keys: swing-cache-
+          # Same key for all 3 scans on the same day
+          key: swing-daily-${{ env.TODAY }}
+          restore-keys: |
+            swing-daily-
 
+      # ─── Detect which scan to run ───
       - name: Detect scan type
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "SCAN_TYPE=${{ github.event.inputs.scan_type }}" >> $GITHUB_ENV
           else
             HOUR=$(date -u +%H)
-            if [ "$HOUR" = "12" ]; then echo "SCAN_TYPE=scan1" >> $GITHUB_ENV
+            MIN=$(date -u +%M)
+            echo "UTC time: ${HOUR}:${MIN}"
+            if   [ "$HOUR" = "12" ]; then echo "SCAN_TYPE=scan1" >> $GITHUB_ENV
             elif [ "$HOUR" = "14" ]; then echo "SCAN_TYPE=scan2" >> $GITHUB_ENV
-            elif [ "$HOUR" = "03" ]; then echo "SCAN_TYPE=scan3" >> $GITHUB_ENV
+            elif [ "$HOUR" = "04" ]; then echo "SCAN_TYPE=scan3" >> $GITHUB_ENV
             else echo "SCAN_TYPE=scan1" >> $GITHUB_ENV
             fi
           fi
+          echo "Running: $SCAN_TYPE"
 
-      - name: Run scan
+      # ─── Run the scan ───
+      - name: Run Swing Hunter
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python swing_hunter.py $SCAN_TYPE
-        timeout-minutes: 55
+        run: |
+          echo "=== Starting $SCAN_TYPE at $(date) ==="
+          python swing_hunter.py $SCAN_TYPE
+          echo "=== Completed at $(date) ==="
+        timeout-minutes: 80
 
-      - name: Save cache
+      # ─── Save cache (ALWAYS — even if scan fails partially) ───
+      - name: Save daily cache
         if: always()
         uses: actions/cache@v4
         with:
@@ -78,12 +95,17 @@ jobs:
             shortlist.json
             fundamentals_cache.json
             stocks_cache.json
-          key: swing-cache-${{ github.run_id }}
+          key: swing-daily-${{ env.TODAY }}
 
-      - name: Upload logs
+      # ─── Upload logs as artifact ───
+      - name: Upload scan artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ env.SCAN_TYPE }}-${{ github.run_number }}
-          path: "*.log"
-          retention-days: 7
+          name: scan-${{ env.SCAN_TYPE }}-${{ github.run_number }}
+          path: |
+            *.log
+            scan_*.json
+            shortlist.json
+          retention-days: 14
+          if-no-files-found: ignore
