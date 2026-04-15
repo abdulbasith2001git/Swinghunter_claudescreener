@@ -30,8 +30,8 @@ PYTHONANYWHERE (run without laptop — FREE):
   OR: Use your laptop with the auto scheduler (keeps all 3 scans)
 """
 
-INSTALL:
-  pip install yfinance pandas requests schedule
+#INSTALL:
+ # pip install yfinance pandas requests schedule
 
 
 import time, datetime, sys, json, smtplib, os, logging, random
