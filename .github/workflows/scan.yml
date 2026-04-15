@@ -40,7 +40,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install packages
-        run: pip install yfinance pandas requests
+        run: pip install yfinance pandas requests schedule
 
       # ─── FIX: Use DATE-based cache key so all 3 scans share the same cache ───
       - name: Get today's date
