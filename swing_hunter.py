@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         SWING HUNTER v6.0 — 3-Scan Pro System               ║
+║         SWING HUNTER v7.0 — 2-Scan + Telegram Bot               ║
 ║                                                              ║
-║  SCAN 1 @ 6:00 PM  → Full universe scan, NSE bhavcopy loaded║
-║  SCAN 2 @ 8:00 PM  → Recheck shortlisted stocks only        ║
-║  SCAN 3 @ 9:30 AM  → Pre-market final verdict BUY/WAIT/SKIP ║
+║  SCAN 1 @ 8:00 PM IST → Full scan after market close║
+║  SCAN 2 @ 9:30 AM IST → Final verdict before market open        ║
+║  BOT MODE  → Control via Telegram commands ║
 ║                                                              ║
 ║  All alerts → Telegram                                       ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -28,11 +28,10 @@ PYTHONANYWHERE (run without laptop — FREE):
        Task 3: 03:45 UTC = 9:15 AM IST  → python /home/USER/swing_hunter.py scan3  # 9:30 AM IST = 04:00 UTC
   NOTE: Free account only allows 1 task. Upgrade to $5/month for 3 tasks.
   OR: Use your laptop with the auto scheduler (keeps all 3 scans)
+
+INSTALL:
+  pip install yfinance pandas requests schedule
 """
-
-#INSTALL:
- # pip install yfinance pandas requests schedule
-
 
 import time, datetime, sys, json, smtplib, os, logging, random
 from email.mime.text import MIMEText
@@ -79,9 +78,9 @@ CONFIG = {
     "GMAIL_TO"      : "",
 
     # Scan times (IST)
-    "SCAN1_TIME"    : "18:00",   # 6:00 PM — full universe scan
-    "SCAN2_TIME"    : "20:00",   # 8:00 PM — recheck shortlist
-    "SCAN3_TIME"    : "09:30",   # 9:15 AM next morning — final verdict
+    "EVENING_TIME"  : "20:00",   # 8:00 PM IST — full universe scan
+    "MORNING_TIME"  : "09:30",   # 9:30 AM IST — recheck shortlist
+    # scan3 removed - now just 2 scans   # 9:15 AM next morning — final verdict
 
     # Capital
     "TOTAL_CAPITAL" : 5000,
@@ -623,6 +622,114 @@ def get_verdict(stock, scan_type="scan1"):
 
     return verdict, action, green, issues
 
+
+# ══════════════════════════════════════════════════════════════
+#  📈 ACTIVE TRADE TRACKER — Hold/Sell advice for open trades
+# ══════════════════════════════════════════════════════════════
+def load_trades():
+    if not os.path.exists(TRADES_FILE): return []
+    try:
+        with open(TRADES_FILE) as f: return json.load(f)
+    except: return []
+
+def save_trades(trades):
+    with open(TRADES_FILE, 'w') as f: json.dump(trades, f, indent=2)
+
+def save_results_as_trades(results, scan_time):
+    trades = load_trades()
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=9)).isoformat()
+    trades = [t for t in trades if t.get('date','') > cutoff]
+    existing = {t['symbol'] for t in trades}
+    for r in results:
+        if r['symbol'] not in existing:
+            trades.append({
+                'symbol'     : r['symbol'],
+                'entry_price': r['close'],
+                'date'       : scan_time,
+                'sl'         : r['sl'],
+                'target1'    : r['target1'],
+                'target2'    : r['target2'],
+                'score'      : r['score'],
+                'pos_size'   : r.get('pos_size', 1),
+            })
+    save_trades(trades)
+
+def check_active_trades():
+    trades = load_trades()
+    if not trades: return []
+    report = []
+    for t in trades:
+        try:
+            df   = yf.Ticker(f"{t['symbol']}.NS").history(period="2d", interval="1d")
+            if df is None or len(df) == 0: continue
+            curr = round(float(df['Close'].iloc[-1]), 2)
+            ep   = t['entry_price']
+            sl   = t['sl']
+            t1   = t['target1']
+            t2   = t['target2']
+            pnl  = round(((curr - ep) / ep) * 100, 2)
+            try:
+                days = (datetime.datetime.now() -
+                        datetime.datetime.fromisoformat(t['date'])).days
+            except: days = 1
+
+            if curr <= sl:
+                action = "🔴 SL HIT — EXIT NOW. Don't wait!"
+                emoji  = "🔴"
+            elif curr >= t2:
+                action = "🟢 T2 HIT — EXIT ALL. Full profit!"
+                emoji  = "🟢"
+            elif curr >= t1:
+                action = "🟡 T1 HIT — Sell half. Move SL to cost."
+                emoji  = "🟡"
+            elif days >= 7:
+                action = "⏰ DAY 7 — Exit today. Rule is rule!"
+                emoji  = "⏰"
+            elif pnl >= 10:
+                action = "🟢 HOLD — Move SL to EMA20 (lock profits)"
+                emoji  = "🟢"
+            elif pnl >= 5:
+                action = "🟢 HOLD — Move SL to cost price (free trade!)"
+                emoji  = "🟢"
+            elif pnl >= 0:
+                action = "🟢 HOLD — In profit. Maintain original SL."
+                emoji  = "🟢"
+            elif pnl >= -3:
+                action = "🟡 HOLD — Near SL. Watch closely today."
+                emoji  = "🟡"
+            else:
+                action = "🔴 WARNING — Deep in loss. Check if SL hit."
+                emoji  = "🔴"
+
+            report.append({
+                'symbol'   : t['symbol'],
+                'entry'    : ep,
+                'current'  : curr,
+                'pnl_pct'  : pnl,
+                'sl'       : sl,
+                'target1'  : t1,
+                'target2'  : t2,
+                'days_held': days,
+                'action'   : action,
+                'emoji'    : emoji,
+            })
+        except: continue
+    return report
+
+def build_trades_msg(report):
+    if not report:
+        return ("📋 NO ACTIVE TRADES\n\n"
+                "Trades appear here automatically after evening scan.\n"
+                "Run /scan to find stocks.")
+    now = datetime.datetime.now().strftime('%d %b %Y %I:%M %p')
+    msg = f"📋 ACTIVE TRADES — {now}\n{'─'*32}\n\n"
+    for t in report:
+        pnl = f"{'+' if t['pnl_pct']>=0 else ''}{t['pnl_pct']}%"
+        msg += (f"{t['emoji']} <b>{t['symbol']}</b> Day {t['days_held']}\n"
+                f"   Entry Rs.{t['entry']} → Now Rs.{t['current']} ({pnl})\n"
+                f"   {t['action']}\n\n")
+    return msg
+
 # ══════════════════════════════════════════════════════════════
 #  💬 MESSAGE BUILDERS
 # ══════════════════════════════════════════════════════════════
@@ -637,6 +744,15 @@ def msg_scan1(results, scanned, nse_date, nifty_ret, banknifty_ret, market_mode)
             f"Nifty5D:{'+ ' if nifty_ret>=0 else ''}{nifty_ret}% | BankNifty5D:{'+ ' if banknifty_ret>=0 else ''}{banknifty_ret}%\n"
             f"{nse}\n"
             f"Scanned: {scanned} stocks\n\n")
+
+    # Show active trades status if any
+    trade_report = check_active_trades()
+    if trade_report:
+        msg += "📋 OPEN TRADES STATUS:\n"
+        for t in trade_report:
+            pnl = f"{chr(43) if t['pnl_pct']>=0 else ''}{t['pnl_pct']}%"
+            msg += f"  {t['emoji']} {t['symbol']} {pnl} Day{t['days_held']} — {t['action']}\n"
+        msg += "\n"
 
     if not results:
         return msg + ("❌ No stocks passed today's filters.\n\n"
@@ -870,7 +986,7 @@ def get_market_data():
 
     return nifty_ret, banknifty_ret, mode
 
-def run_scan1():
+def run_evening_scan():
     """6:00 PM — Full universe scan with final bhavcopy data"""
     now = datetime.datetime.now()
     if now.weekday() >= 5:
@@ -912,7 +1028,7 @@ def run_scan1():
     msg = msg_scan1(results, len(stocks), nse_date, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
 
-def run_scan2():
+def run_morning_scan_recheck():
     """8:00 PM — Recheck only shortlisted stocks"""
     now = datetime.datetime.now()
     if now.weekday() >= 5: return
@@ -924,7 +1040,7 @@ def run_scan2():
     # Load scan1 shortlist
     if not os.path.exists(SHORTLIST_FILE):
         log.warning("No Scan 1 shortlist found — running full scan")
-        run_scan1(); return
+        run_evening_scan(); return
 
     with open(SHORTLIST_FILE) as f:
         prev_data = json.load(f)
@@ -966,7 +1082,7 @@ def run_scan2():
     msg = msg_scan2(results, prev_results, nse_date, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
 
-def run_scan3():
+def run_morning_scan():
     """9:15 AM — Pre-market final verdict"""
     now = datetime.datetime.now()
     if now.weekday() >= 5: return
@@ -1087,16 +1203,177 @@ def test_telegram():
     ok = send_telegram(msg)
     print("SUCCESS! Check Telegram!" if ok else "FAILED! Check TOKEN/CHAT_ID")
 
+
+# ══════════════════════════════════════════════════════════════
+#  🤖 TELEGRAM BOT — Full command controller
+# ══════════════════════════════════════════════════════════════
+def get_tg_updates(offset=0):
+    tok = CONFIG['TELEGRAM_TOKEN']
+    if not tok: return [], 0
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{tok}/getUpdates",
+            params={'offset': offset, 'timeout': 30, 'allowed_updates': ['message']},
+            timeout=35
+        )
+        data = r.json()
+        if not data.get('ok'): return [], offset
+        updates = data.get('result', [])
+        return updates, (updates[-1]['update_id'] + 1 if updates else offset)
+    except: return [], offset
+
+def tg_authorized(chat_id):
+    return str(chat_id) == str(CONFIG['TELEGRAM_CHAT_ID'])
+
+def handle_tg_command(text, chat_id):
+    if not tg_authorized(chat_id):
+        return "Unauthorized"
+    cmd = text.strip().lower().split()[0]
+
+    if cmd in ['/scan', '/evening', '/scan1']:
+        send_telegram("Starting evening scan... (~8 min)")
+        run_evening_scan()
+        return None
+
+    elif cmd in ['/morning', '/scan2', '/scan3']:
+        send_telegram("Starting morning scan...")
+        run_morning_scan()
+        return None
+
+    elif cmd == '/relax':
+        RULES['SCAN_MODE'] = 'RELAXED'
+        return ("RELAXED mode ON\n\nRSI max:76 ADX min:14 Vol:1.1x\n"
+                "More stocks will appear.\nSend /scan to scan.")
+
+    elif cmd == '/strict':
+        RULES['SCAN_MODE'] = 'STRICT'
+        return ("STRICT mode ON\n\nRSI max:72 ADX min:18 Vol:1.4x\n"
+                "Quality stocks only.\nSend /scan to scan.")
+
+    elif cmd == '/relax_scan':
+        RULES['SCAN_MODE'] = 'RELAXED'
+        send_telegram("Relaxed mode. Scanning...")
+        run_evening_scan()
+        return None
+
+    elif cmd == '/strict_scan':
+        RULES['SCAN_MODE'] = 'STRICT'
+        send_telegram("Strict mode. Scanning...")
+        run_evening_scan()
+        return None
+
+    elif cmd == '/trades':
+        return build_trades_msg(check_active_trades())
+
+    elif cmd == '/status':
+        shortlist = []
+        last_time = "No scan yet"
+        if os.path.exists(SHORTLIST_FILE):
+            try:
+                with open(SHORTLIST_FILE) as f: d = json.load(f)
+                shortlist = d.get('results', [])
+                last_time = d.get('time','')[:16].replace('T',' ')
+            except: pass
+        trades = load_trades()
+        sl_str = ', '.join([r['symbol'] for r in shortlist[:5]]) or "None"
+        return (f"STATUS\n{'─'*25}\n"
+                f"Mode    : {RULES.get('SCAN_MODE','STRICT')}\n"
+                f"Capital : Rs.{CONFIG['TOTAL_CAPITAL']:,}\n"
+                f"Last scan: {last_time}\n"
+                f"Shortlist: {sl_str}\n"
+                f"Trades  : {len(trades)} active\n"
+                f"Auto: 8PM evening + 9:30AM morning")
+
+    elif cmd == '/capital':
+        shortlist = []
+        if os.path.exists(SHORTLIST_FILE):
+            try:
+                with open(SHORTLIST_FILE) as f:
+                    shortlist = json.load(f).get('results', [])
+            except: pass
+        if not shortlist: return "No shortlist. Run /scan first."
+        cap = CONFIG['TOTAL_CAPITAL']
+        alloc = [0.40,0.35,0.25] if len(shortlist)>=3 else [0.55,0.45] if len(shortlist)==2 else [1.0]
+        msg = f"CAPITAL PLAN (Rs.{cap:,})\n"
+        for r, a in zip(shortlist, alloc):
+            amt = round(cap*a)
+            sh  = max(1, int(amt/r['close']))
+            msg += f"{r['symbol']}: Rs.{amt:,} ({int(a*100)}%) — {sh} shares\n"
+            msg += f"  SL:Rs.{r['sl']} T2:Rs.{r['target2']}\n"
+        return msg
+
+    elif cmd == '/help':
+        return ("SWING HUNTER COMMANDS\n" + "─"*25 + "\n"
+                "/scan         Evening scan now\n"
+                "/morning      Morning verdict\n"
+                "/relax        Relaxed filters\n"
+                "/strict       Strict filters\n"
+                "/relax_scan   Relax + scan now\n"
+                "/strict_scan  Strict + scan now\n"
+                "/trades       Hold/sell advice\n"
+                "/status       Config + shortlist\n"
+                "/capital      Capital allocation\n"
+                "/help         This message")
+
+    elif cmd == '/stop':
+        RUNTIME['bot_active'] = False
+        return "Bot stopped."
+
+    else:
+        return "Unknown. Send /help"
+
+def run_bot():
+    tok = CONFIG['TELEGRAM_TOKEN']
+    cid = CONFIG['TELEGRAM_CHAT_ID']
+    if not tok or not cid:
+        print("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in CONFIG")
+        return
+
+    log.info("BOT STARTED — listening for Telegram commands")
+    send_telegram(("Swing Hunter Bot ONLINE!\n\n"
+                   f"Mode: {RULES.get('SCAN_MODE','STRICT')}\n"
+                   "Auto: 8:00 PM + 9:30 AM IST\n\n"
+                   "Send /help to see all commands"))
+
+    if HAS_SCHEDULE:
+        schedule.every().day.at(CONFIG['EVENING_TIME']).do(run_evening_scan)
+        schedule.every().day.at(CONFIG['MORNING_TIME']).do(run_morning_scan)
+        log.info(f"Scheduled: {CONFIG['EVENING_TIME']} + {CONFIG['MORNING_TIME']} IST")
+
+    offset = 0
+    while RUNTIME['bot_active']:
+        try:
+            if HAS_SCHEDULE: schedule.run_pending()
+            updates, offset = get_tg_updates(offset)
+            for upd in updates:
+                msg_data = upd.get('message', {})
+                text     = msg_data.get('text', '').strip()
+                chat_id  = msg_data.get('chat', {}).get('id', '')
+                name     = msg_data.get('from', {}).get('first_name', 'User')
+                if text and text.startswith('/'):
+                    log.info(f"Command [{name}]: {text}")
+                    resp = handle_tg_command(text, chat_id)
+                    if resp: send_telegram(resp)
+        except KeyboardInterrupt:
+            log.info("Bot stopped.")
+            send_telegram("Bot stopped.")
+            break
+        except Exception as e:
+            log.error(f"Bot error: {e}")
+            time.sleep(5)
+        time.sleep(1)
+
 # ══════════════════════════════════════════════════════════════
 #  ▶  ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 def main():
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
-    if cmd == "scan1":    run_scan1();    return
-    if cmd == "scan2":    run_scan2();    return
-    if cmd == "scan3":    run_scan3();    return
+    if cmd == "scan1":    run_evening_scan();    return
+    if cmd == "scan2":    run_morning_scan();    return
+    if cmd == "scan3":    run_morning_scan();    return
     if cmd == "test":     run_test();     return
     if cmd == "telegram": test_telegram();return
+    if cmd == "bot":      run_bot();      return
 
     stocks = get_stock_list()
     fund_cache  = load_fund_cache()
@@ -1132,13 +1409,12 @@ def main():
         print("  ⚠️  Install schedule: pip install schedule")
         print("  Then re-run without arguments for auto scheduler")
         return
-    schedule.every().day.at(CONFIG['SCAN1_TIME']).do(run_scan1)
-    schedule.every().day.at(CONFIG['SCAN2_TIME']).do(run_scan2)
-    schedule.every().day.at(CONFIG['SCAN3_TIME']).do(run_scan3)
+    schedule.every().day.at(CONFIG['EVENING_TIME']).do(run_evening_scan)
+    schedule.every().day.at(CONFIG['MORNING_TIME']).do(run_morning_scan)
 
-    print(f"  ⏰ Scan 1 scheduled: {CONFIG['SCAN1_TIME']} IST (full scan)")
-    print(f"  ⏰ Scan 2 scheduled: {CONFIG['SCAN2_TIME']} IST (recheck)")
-    print(f"  ⏰ Scan 3 scheduled: {CONFIG['SCAN3_TIME']} IST (final verdict)")
+    print(f"  ⏰ Scan 1 scheduled: {CONFIG['EVENING_TIME']} IST (full scan)")
+    print(f"  ⏰ Scan 2 scheduled: {CONFIG['MORNING_TIME']} IST (recheck)")
+    print(f"  ⏰ Scan 3 scheduled: {CONFIG['MORNING_TIME']} IST (final verdict)")
     print("  Keep window open. Ctrl+C to stop.\n")
 
     while True:
