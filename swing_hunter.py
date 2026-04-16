@@ -126,7 +126,8 @@ RULES = {
 # ══════════════════════════════════════════════════════════════
 STOCKS_CACHE_FILE  = "stocks_cache.json"
 FUND_CACHE_FILE    = "fundamentals_cache.json"
-SHORTLIST_FILE     = "shortlist.json"   # Scan 1 saves here, Scan 2 & 3 read from here
+SHORTLIST_FILE     = "shortlist.json"
+TRADES_FILE        = "active_trades.json"      # ← ADD THIS LINE
 LOG_FILE           = f"swing_hunter_{datetime.datetime.now().strftime('%Y%m%d')}.log"
 
 FALLBACK_STOCKS = sorted(set([
@@ -1088,7 +1089,7 @@ def run_morning_scan_recheck():
         json.dump({'time':now.isoformat(),'scan':'scan2',
                    'results':results,'nifty_ret':nifty_ret,
                    'market_mode':market_mode,'nse_date':nse_date}, f, indent=2)
-
+    save_results_as_trades(results, now.isoformat())
     log.info(f"\nSCAN 2 DONE: {len(results)} stocks confirmed")
     msg = msg_scan2(results, prev_results, nse_date, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
@@ -1140,7 +1141,7 @@ def run_morning_scan():
 
     save_fund_cache(fund_cache)
     results.sort(key=lambda x: x['score'], reverse=True)
-
+    save_results_as_trades(results, now.isoformat())
     log.info(f"\nSCAN 3 DONE: {len(results)} stocks cleared final check")
     msg = msg_scan3(results, prev_results, nifty_ret, banknifty_ret, market_mode)
     send_telegram(msg)
