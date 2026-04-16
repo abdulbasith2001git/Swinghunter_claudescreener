@@ -90,27 +90,27 @@ CONFIG = {
 #  📊 SCREENER RULES
 # ══════════════════════════════════════════════════════════════
 RULES = {
-    "MIN_PRICE"         : 50,
-    "MAX_PRICE"         : 3000,
-    "RSI_MIN"           : 50,
-    "RSI_MAX"           : 72,
-    "ADX_MIN"           : 18,
-    "VOLUME_MULT"       : 1.4,
+    "MIN_PRICE"         : 80,    # Rs.80+ for better quantity
+    "MAX_PRICE"         : 1500,  # Rs.1500 max — more shares for Rs.5K
+    "RSI_MIN"           : 52,    # slightly above 50 filters weak stocks
+    "RSI_MAX"           : 75,    # 75 not 78 — 78+ is overbought
+    "ADX_MIN"           : 16,    # catch momentum earlier
+    "VOLUME_MULT"       : 1.6,    # raised — momentum needs volume
     "BREAKOUT_DAYS"     : 10,
-    "BREAKOUT_MIN_PCT"  : 0.2,
-    "CANDLE_MIN_PCT"    : 0.2,
-    "EMA20_MAX_STRETCH" : 1.10,
+    "BREAKOUT_MIN_PCT"  : 0.3,    # small raise — NOT 3.0
+    "CANDLE_MIN_PCT"    : 0.3,
+    "EMA20_MAX_STRETCH" : 1.12,  # slightly more room
     "REQUIRE_EMA_STACK" : True,
     "REQUIRE_SMA200"    : False,
     "USE_DELIVERY"      : True,
-    "MIN_DELIVERY_PCT"  : 30,
+    "MIN_DELIVERY_PCT"  : 35,    # real buying confirmation
     "USE_ANTI_GAP"      : True,
-    "MAX_GAP_PCT"       : 3.5,
+    "MAX_GAP_PCT"       : 4.0,    # 4% gap ok if volume confirms
     "USE_FUND_FILTER"   : True,
-    "MIN_ROE"           : 8,     # Block truly bad fundamentals
-    "MAX_DEBT_EQUITY"   : 1.8,   # Block high debt
-    "MIN_PROFIT_MARGIN" : 3,     # Must be profitable
-    "MIN_REV_GROWTH"    : -5,    # Block heavily declining revenue
+    "MIN_ROE"           : 5,     # light filter — momentum stocks ok
+    "MAX_DEBT_EQUITY"   : 2.5,   # loosened for infra/utility stocks
+    "MIN_PROFIT_MARGIN" : 2,     # loosened — allow growth-stage
+    "MIN_REV_GROWTH"    : -8,    # loosened — slight dip allowed
     "BULL_THRESHOLD"    : 1.5,
     "BEAR_THRESHOLD"    : -3.0,
 
@@ -416,17 +416,19 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
         is_bull   = market_mode == "BULL"
 
         if is_bull and scan_mode == 'STRICT':
-            # Auto-relax in confirmed bull market
-            rsi_max_eff = min(RULES['RSI_MAX'] + 3, 75)   # 72 → 75
-            adx_min_eff = max(RULES['ADX_MIN'] - 2, 14)   # 18 → 16
-            vol_min_eff = max(RULES['VOLUME_MULT'] - 0.2, 1.1)  # 1.4 → 1.2
-            del_min_eff = max(RULES['MIN_DELIVERY_PCT'] - 5, 25) # 30 → 25
+            # Bull market — auto-loosen slightly
+            rsi_max_eff = min(RULES['RSI_MAX'] + 2, 77)   # 75 → 77
+            adx_min_eff = max(RULES['ADX_MIN'] - 2, 12)   # 16 → 14
+            vol_min_eff = max(RULES['VOLUME_MULT'] - 0.2, 1.2)  # 1.6 → 1.4
+            del_min_eff = max(RULES['MIN_DELIVERY_PCT'] - 5, 28) # 35 → 28
         elif scan_mode == 'RELAXED':
-            rsi_max_eff = min(RULES['RSI_MAX'] + 5, 76)
-            adx_min_eff = max(RULES['ADX_MIN'] - 4, 12)
-            vol_min_eff = max(RULES['VOLUME_MULT'] - 0.3, 1.0)
-            del_min_eff = max(RULES['MIN_DELIVERY_PCT'] - 10, 20)
+            # /relax command — most stocks pass
+            rsi_max_eff = 78
+            adx_min_eff = 12
+            vol_min_eff = 1.2
+            del_min_eff = 25
         else:
+            # STRICT default
             rsi_max_eff = RULES['RSI_MAX']
             adx_min_eff = RULES['ADX_MIN']
             vol_min_eff = RULES['VOLUME_MULT']
@@ -474,11 +476,19 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
         sms = sm_score(deliv,vr)
         fs_ = final_score(ts,fs,sms)
 
-        sl  = round(c*0.95,2); t1 = round(c*1.08,2); t2 = round(c*1.15,2)
+        sl  = round(c*0.95,2)
+        t1  = round(c*1.08,2)   # +8%  T1 — sell half
+        t2  = round(c*1.12,2)   # +12% T2 — realistic 1-week target
         rr  = round((t2-c)/(c-sl),1)
-        risk_amt = CONFIG['TOTAL_CAPITAL']*0.02
-        pos = max(1,int(risk_amt/(c-sl))) if (c-sl)>0 else 1
-        inv = round(min(pos*c, CONFIG['TOTAL_CAPITAL']),0)
+        # Risk 5% of capital — allows meaningful Rs.300+ profit
+        risk_per_trade = CONFIG['TOTAL_CAPITAL']*0.05  # Rs.250 risk
+        sl_gap = c-sl
+        pos = max(2,int(risk_per_trade/sl_gap)) if sl_gap>0 else 2
+        inv = round(pos*c, 0)
+        if inv > CONFIG['TOTAL_CAPITAL']:
+            pos = max(2, int(CONFIG['TOTAL_CAPITAL']/c))
+            inv = round(pos*c, 0)
+        profit_t2 = round((t2-c)*pos, 0)  # Expected profit at T2
         pos = max(1,int(inv/c))
 
         return {
@@ -490,7 +500,7 @@ def check_stock(symbol, delivery_map, fund_cache, nifty_ret=0, market_mode="NEUT
             'roe':roe,'debt_eq':de,'profit_m':pm,'rev_growth':rg,'sector':sect,
             'tech_score':ts,'fund_score':fs,'sm_score':sms,'score':fs_,
             'sl':sl,'target1':t1,'target2':t2,'rr':rr,
-            'pos_size':pos,'invest_amt':inv,
+            'pos_size':pos,'invest_amt':inv,'profit_t2':profit_t2,
         }
     except: return None
 
@@ -646,11 +656,12 @@ def save_results_as_trades(results, scan_time):
                 'symbol'     : r['symbol'],
                 'entry_price': r['close'],
                 'date'       : scan_time,
-                'sl'         : r['sl'],
-                'target1'    : r['target1'],
-                'target2'    : r['target2'],
+                'sl'         : r['sl'],         # 5% SL
+                'target1'    : r['target1'],     # +8%
+                'target2'    : r['target2'],     # +12%
                 'score'      : r['score'],
-                'pos_size'   : r.get('pos_size', 1),
+                'pos_size'   : r.get('pos_size', 2),
+                'profit_t2'  : r.get('profit_t2', 0),
             })
     save_trades(trades)
 
@@ -780,8 +791,8 @@ def msg_scan1(results, scanned, nse_date, nifty_ret, banknifty_ret, market_mode)
         if r['debt_eq'] is not None:     fund_parts.append(f"D/E:{r['debt_eq']}")
         if r['rev_growth']:              fund_parts.append(f"RevG:{r['rev_growth']}%")
         if fund_parts: msg += f"   {' | '.join(fund_parts)}\n"
-        msg += f"   SL: Rs.{r['sl']} | T1: Rs.{r['target1']} | T2: Rs.{r['target2']}\n"
-        msg += f"   R:R = 1:{r['rr']} | Buy {r['pos_size']} shares ≈ Rs.{r['invest_amt']}\n"
+        msg += f"   SL: Rs.{r['sl']} (-5%) | T1: Rs.{r['target1']} (+8%) | T2: Rs.{r['target2']} (+12%)\n"
+        msg += f"   R:R=1:{r['rr']} | {r['pos_size']} shares≈Rs.{r['invest_amt']} | Est.profit Rs.{r.get('profit_t2',0):.0f}\n\n"
         for iss in issues[:1]: msg += f"   ⚠️ {iss}\n"
         msg += "\n"
 
@@ -844,8 +855,8 @@ def msg_scan2(results, prev_results, nse_date, nifty_ret, banknifty_ret, market_
         msg += f"   Breakout: +{r['bo_pct']}%"
         if r['delivery']: msg += f" | Delivery: {r['delivery']}%"
         msg += f" | 52WH: -{r['p52wh']}%\n"
-        msg += f"   SL: Rs.{r['sl']} | T1: Rs.{r['target1']} | T2: Rs.{r['target2']}\n"
-        msg += f"   R:R = 1:{r['rr']} | Buy {r['pos_size']} shares ≈ Rs.{r['invest_amt']}\n"
+        msg += f"   SL: Rs.{r['sl']} (-5%) | T1: Rs.{r['target1']} (+8%) | T2: Rs.{r['target2']} (+12%)\n"
+        msg += f"   R:R=1:{r['rr']} | {r['pos_size']} shares≈Rs.{r['invest_amt']} | Est.profit Rs.{r.get('profit_t2',0):.0f}\n"
 
         # Green flags
         for g in green[:2]: msg += f"   ✅ {g}\n"
@@ -916,7 +927,7 @@ def msg_scan3(results, prev_results, nifty_ret, banknifty_ret, market_mode):
             msg += f"   SL     : Rs.{r['sl']} (-5%) ← GTT order immediately!\n"
             msg += f"   Target1: Rs.{r['target1']} (+8%) ← sell half here\n"
             msg += f"   Target2: Rs.{r['target2']} (+15%) ← sell rest here\n"
-            msg += f"   Shares : {r['pos_size']} shares = Rs.{r['invest_amt']}\n"
+            msg += f"   Shares : {r['pos_size']} shares = Rs.{r['invest_amt']} | Est.profit Rs.{r.get('profit_t2',0):.0f}\n"
             msg += f"   R:R    : 1:{r['rr']}\n"
             msg += f"   Exit   : Day 7 max — no exceptions!\n\n"
             for g in green[:3]: msg += f"   ✅ {g}\n"
