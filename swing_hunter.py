@@ -1177,7 +1177,7 @@ def run_test():
     else:  print(f"   ⚠️  Unavailable ({datetime.datetime.now().strftime('%A')})")
 
     print("\n📊 Nifty Market Regime")
-    nifty_ret, mode = get_market_data()
+    nifty_ret, mode, _ = get_market_data()
     print(f"   ✅ 5D Return: {'+' if nifty_ret>=0 else ''}{nifty_ret}% — {mode}")
 
     print("\n📱 Telegram")
